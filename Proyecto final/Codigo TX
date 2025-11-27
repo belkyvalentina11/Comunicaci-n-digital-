@@ -1,0 +1,63 @@
+# TX
+from machine import Pin, SPI, ADC
+from nrf24l01 import NRF24L01
+import utime, struct
+
+# ===== NRF CONFIG =====
+spi = SPI(0, sck=Pin(2), mosi=Pin(3), miso=Pin(4))
+ce  = Pin(6, Pin.OUT, value=0)
+csn = Pin(5, Pin.OUT, value=1)
+
+PIPE_CMD = b'\xe1\xf0\xf0\xf0\xf0'   # TX -> CAR
+
+nrf = NRF24L01(spi, csn, ce, channel=120, payload_size=32)
+nrf.open_tx_pipe(PIPE_CMD)
+
+# (Opcional) Eliminar tweaks:
+# nrf.reg_write(0x04, 0x5F)
+# nrf.reg_write(0x06, 0x07)
+
+# Forzar modo SIN ACK:
+nrf.set_auto_ack(False)
+
+joy_steer = ADC(26)
+joy_throttle = ADC(28)
+
+SERVO_MIN = 600
+SERVO_MAX = 2500
+SERVO_CENTER = 1500
+ESC_MIN = 1000
+ESC_MAX = 2000
+
+def steering_curve(raw):
+    x = (raw / 65535) * 2 - 1
+    if abs(x) < 0.03:
+        x = 0
+    expo = 0.8
+    x = x * (1 - expo) + (x * x * x) * expo
+    angle = x * 900
+    us = SERVO_CENTER + angle
+    if us < SERVO_MIN: us = SERVO_MIN
+    if us > SERVO_MAX: us = SERVO_MAX
+    return int(us)
+
+def map_throttle(raw):
+    return int(ESC_MIN + (raw * (ESC_MAX - ESC_MIN) / 65535))
+
+print("📡 TX listo SIN ACK")
+
+while True:
+    steer_us = steering_curve(joy_steer.read_u16())
+    throttle_us = map_throttle(joy_throttle.read_u16())
+
+    payload = struct.pack('<HH', steer_us, throttle_us)
+
+    nrf.stop_listening()
+    try:
+        nrf.send(payload)
+    except Exception as e:
+        print("⚠ Error enviando paquete:", e)
+
+    print(f"➡ Enviado | servo={steer_us} | esc={throttle_us}")
+
+    utime.sleep_ms(12)
