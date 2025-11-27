@@ -1,1 +1,234 @@
+import { useState, useEffect, useCallback } from 'react';
+import { ConnectionPanel } from '@/components/telemetry/ConnectionPanel';
+import { CircularGauge } from '@/components/telemetry/CircularGauge';
+import { PWMIndicator } from '@/components/telemetry/PWMIndicator';
+import { RealTimeChart } from '@/components/telemetry/RealTimeChart';
+import { AlertBanner } from '@/components/telemetry/AlertBanner';
+import { DataLogger } from '@/components/telemetry/DataLogger';
+import { GPSMap } from '@/components/telemetry/GPSMap';
+import { Activity } from 'lucide-react';
+
+interface TelemetryData {
+  timestamp: number;
+  voltaje_bateria: number;
+  temperatura_motor: number;
+  latitud: number;
+  longitud: number;
+  velocidad: number;
+  aceleracion_x: number;
+  aceleracion_y: number;
+  aceleracion_z: number;
+  giroscopio_x: number;
+  giroscopio_y: number;
+  giroscopio_z: number;
+  pwm_motor: number;
+  pwm_direccion: number;
+}
+
+interface Alert {
+  id: string;
+  title: string;
+  message: string;
+  type: 'warning' | 'danger';
+}
+
+const Index = () => {
+  const [isConnected, setIsConnected] = useState(false);
+  const [port, setPort] = useState<SerialPort | null>(null);
+  const [dataRate, setDataRate] = useState(0);
+  const [telemetryData, setTelemetryData] = useState<TelemetryData[]>([]);
+  const [currentData, setCurrentData] = useState<TelemetryData>({
+    timestamp: Date.now(),
+    voltaje_bateria: 7.4,
+    temperatura_motor: 35,
+    latitud: 4.7110,
+    longitud: -74.0721,
+    velocidad: 0,
+    aceleracion_x: 0,
+    aceleracion_y: 0,
+    aceleracion_z: 0,
+    giroscopio_x: 0,
+    giroscopio_y: 0,
+    giroscopio_z: 0,
+    pwm_motor: 0,
+    pwm_direccion: 1500,
+  });
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [imuData, setImuData] = useState<any[]>([]);
+
+  // Simulated data for demonstration
+  useEffect(() => {
+    if (isConnected) {
+      const interval = setInterval(() => {
+        const newData: TelemetryData = {
+          timestamp: Date.now(),
+          voltaje_bateria: 7.4 + Math.random() * 0.5 - 0.25,
+          temperatura_motor: 35 + Math.random() * 10,
+          latitud: 4.7110 + (Math.random() - 0.5) * 0.001,
+          longitud: -74.0721 + (Math.random() - 0.5) * 0.001,
+          velocidad: Math.random() * 10,
+          aceleracion_x: (Math.random() - 0.5) * 4,
+          aceleracion_y: (Math.random() - 0.5) * 4,
+          aceleracion_z: 9.8 + (Math.random() - 0.5) * 2,
+          giroscopio_x: (Math.random() - 0.5) * 200,
+          giroscopio_y: (Math.random() - 0.5) * 200,
+          giroscopio_z: (Math.random() - 0.5) * 200,
+          pwm_motor: Math.random() * 2000,
+          pwm_direccion: 1500 + (Math.random() - 0.5) * 500,
+        };
+
+        setCurrentData(newData);
+        setTelemetryData(prev => [...prev, newData]);
+        setDataRate(Math.floor(Math.random() * 5) + 10);
+
+        // Update IMU chart data
+        setImuData(prev => {
+          const newImuData = [...prev, {
+            time: prev.length,
+            acc_x: newData.aceleracion_x,
+            acc_y: newData.aceleracion_y,
+            acc_z: newData.aceleracion_z,
+          }];
+          return newImuData.slice(-50); // Keep last 50 points
+        });
+
+        // Check for alerts
+        if (newData.voltaje_bateria < 6.8) {
+          const alertId = `voltage-${Date.now()}`;
+          setAlerts(prev => [...prev, {
+            id: alertId,
+            title: 'Batería Baja',
+            message: `Voltaje crítico: ${newData.voltaje_bateria.toFixed(2)}V`,
+            type: 'danger',
+          }]);
+        }
+
+        if (newData.temperatura_motor > 60) {
+          const alertId = `temp-${Date.now()}`;
+          setAlerts(prev => [...prev, {
+            id: alertId,
+            title: 'Temperatura Alta',
+            message: `Motor sobrecalentado: ${newData.temperatura_motor.toFixed(1)}°C`,
+            type: 'warning',
+          }]);
+        }
+      }, 100);
+
+      return () => clearInterval(interval);
+    }
+  }, [isConnected]);
+
+  const handleConnect = useCallback((serialPort: SerialPort) => {
+    setPort(serialPort);
+    setIsConnected(true);
+    setTelemetryData([]);
+    setImuData([]);
+  }, []);
+
+  const handleDisconnect = useCallback(async () => {
+    if (port) {
+      await port.close();
+      setPort(null);
+    }
+    setIsConnected(false);
+  }, [port]);
+
+  const dismissAlert = useCallback((id: string) => {
+    setAlerts(prev => prev.filter(alert => alert.id !== id));
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-background p-6 space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Activity className="h-10 w-10 text-primary animate-pulse-glow" />
+          <div>
+            <h1 className="text-3xl font-bold text-foreground">
+              RC Car Telemetry
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              UMNG 2025 Challenge - Sistema de Monitoreo en Tiempo Real
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Alerts */}
+      <AlertBanner alerts={alerts} onDismiss={dismissAlert} />
+
+      {/* Connection Panel */}
+      <ConnectionPanel
+        onConnect={handleConnect}
+        onDisconnect={handleDisconnect}
+        isConnected={isConnected}
+        dataRate={dataRate}
+      />
+
+      {/* Main Dashboard */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Gauges */}
+        <CircularGauge
+          value={currentData.voltaje_bateria}
+          min={6}
+          max={8.4}
+          unit="V"
+          label="Voltaje Batería"
+          warningThreshold={6.8}
+          dangerThreshold={6.5}
+        />
+
+        <CircularGauge
+          value={currentData.temperatura_motor}
+          min={20}
+          max={80}
+          unit="°C"
+          label="Temperatura Motor"
+          warningThreshold={60}
+          dangerThreshold={70}
+        />
+
+        {/* GPS Map */}
+        <div className="lg:col-span-1">
+          <GPSMap
+            latitude={currentData.latitud}
+            longitude={currentData.longitud}
+            velocity={currentData.velocidad}
+          />
+        </div>
+      </div>
+
+      {/* Charts */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <RealTimeChart
+          title="Acelerómetro (IMU)"
+          data={imuData}
+          lines={[
+            { dataKey: 'acc_x', name: 'Acc X', color: 'hsl(var(--primary))' },
+            { dataKey: 'acc_y', name: 'Acc Y', color: 'hsl(var(--warning))' },
+            { dataKey: 'acc_z', name: 'Acc Z', color: 'hsl(var(--success))' },
+          ]}
+        />
+
+        <div className="space-y-4">
+          <PWMIndicator
+            label="PWM Motor"
+            value={currentData.pwm_motor}
+            max={2000}
+          />
+          <PWMIndicator
+            label="PWM Dirección"
+            value={currentData.pwm_direccion}
+            max={2000}
+          />
+        </div>
+      </div>
+
+      {/* Data Logger */}
+      <DataLogger data={telemetryData} isRecording={isConnected} />
+    </div>
+  );
+};
+
+export default Index;
 
