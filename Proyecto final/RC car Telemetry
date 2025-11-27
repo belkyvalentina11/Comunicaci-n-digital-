@@ -1,1 +1,161 @@
+############################################################
+#  TELEMETRY-RX — Recibe telemetría del carro vía NRF24,
+#  la envía a la PC por UART
+############################################################
 
+import network
+import time
+import urequests
+from machine import Pin, SPI, UART
+import urandom
+from nrf24l01 import NRF24L01
+import struct
+import utime
+
+# =========================================================
+#  CONFIG WIFI (código íntegro del simulador, pero adaptado)
+# =========================================================
+SSID = "RACE_2025"
+PASSWORD = "987654321"
+
+IP_SERVIDOR = "10.10.10.10"
+PUERTO = 5000
+
+CAR_ID = "CAR_01"
+TEAM_NAME = "Equipo Alfa"
+
+API_LAP_URL = "http://{}:{}/api/lap".format(IP_SERVIDOR, PUERTO)
+
+LED = Pin("LED", Pin.OUT)
+SEND_PERIOD_S = 1   # mínimo 1s entre envíos (protección)
+
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+
+    if not wlan.isconnected():
+        print("Conectando a WiFi...")
+        wlan.connect(SSID, PASSWORD)
+
+        t0 = time.ticks_ms()
+        while not wlan.isconnected():
+            if time.ticks_diff(time.ticks_ms(), t0) > 15000:
+                raise RuntimeError("No se pudo conectar al WiFi")
+            time.sleep(0.2)
+
+    print("WiFi conectado:", wlan.ifconfig())
+    return wlan
+
+
+def send_lap(lap_time_ms, lap_number):
+    payload = {
+        "car_id": CAR_ID,
+        "team": TEAM_NAME,
+        "lap_time_ms": lap_time_ms,
+        "lap_number_debug": lap_number
+    }
+    try:
+        print("➡ Enviando lap:", payload)
+        r = urequests.post(API_LAP_URL, json=payload)
+        print("✔ Respuesta servidor:", r.status_code, r.text)
+        r.close()
+
+        LED.value(1)
+        time.sleep(0.05)
+        LED.value(0)
+
+    except Exception as e:
+        print("❌ Error al enviar lap:", e)
+
+
+# =========================================================
+#  CONFIG NRF24 (RX desde CAR)
+# =========================================================
+spi = SPI(0, sck=Pin(2), mosi=Pin(3), miso=Pin(4))
+ce  = Pin(6, Pin.OUT, value=0)
+csn = Pin(5, Pin.OUT, value=1)
+
+PIPE_TX = b'\xd2\xf0\xf0\xf0\xf0'  # desde carro
+PIPE_RX = b'\xe1\xf0\xf0\xf0\xf0'  # ACK opcional
+
+nrf = NRF24L01(spi, csn, ce, channel=120, payload_size=32)
+nrf.open_tx_pipe(PIPE_RX)
+nrf.open_rx_pipe(1, PIPE_TX)
+nrf.start_listening()
+
+print("📡 TELEMETRY-RX listo (NRF24 → PC + WiFi API)")
+
+# =========================================================
+#  UART → PC (CH340)
+# =========================================================
+uart = UART(0, baudrate=115200, tx=Pin(0), rx=Pin(1))
+
+def send_to_pc(text):
+    uart.write(text + "\n")
+
+
+# =========================================================
+#  VARIABLES TIEMPOS DE VUELTA
+# =========================================================
+last_lap = -1
+last_lap_time_ms = time.ticks_ms()
+
+connected_wifi = False
+try:
+    connect_wifi()
+    connected_wifi = True
+except Exception as e:
+    print("⚠ No se pudo conectar a WiFi:", e)
+    print("➡ Continuando solo con UART y NRF24.")
+
+
+# =========================================================
+#  LOOP PRINCIPAL
+# =========================================================
+while True:
+
+    if nrf.any():
+        data = nrf.recv()
+
+        if len(data) >= 15:
+            try:
+                # === Desempaquetar ===
+                temp_x10, gyro_z_x10, lat_i32, lon_i32, sp_x10, lap = \
+                    struct.unpack("<HhiiHB", data[:15])
+
+                # === Convertir ===
+                temp  = temp_x10 / 10
+                gyro  = gyro_z_x10 / 10
+                lat   = lat_i32 / 100000.0
+                lon   = lon_i32 / 100000.0
+                speed = sp_x10 / 10
+
+                # === Enviar CSV por UART a PC ===
+                csv_line = "{:.1f},{:.1f},{:.5f},{:.5f},{:.1f},{}".format(
+                    temp, gyro, lat, lon, speed, lap
+                )
+                send_to_pc(csv_line)
+
+                # ====================================================
+                #  LÓGICA DE TIEMPOS DE VUELTA (lap cambia en TX_car)
+                # ====================================================
+                if lap != last_lap:
+                    now = time.ticks_ms()
+                    lap_time_ms = time.ticks_diff(now, last_lap_time_ms)
+
+                    if last_lap != -1:  # omitir primera vuelta
+                        print(f"🏁 Nueva vuelta {lap}, tiempo = {lap_time_ms} ms")
+
+                        if connected_wifi:
+                            send_lap(lap_time_ms, lap)
+
+                    last_lap = lap
+                    last_lap_time_ms = now
+
+            except Exception as e:
+                send_to_pc(f"ERR_PARSE:{e}")
+
+        else:
+            send_to_pc("ERR_LEN")
+
+    utime.sleep_ms(5)
