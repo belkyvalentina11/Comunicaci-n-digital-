@@ -1,0 +1,310 @@
+# RX_carro
+# RX del carro: recibe comandos por NRF24, controla servo+ESC,
+# detecta vueltas con TCRT usando la secuencia N-B-N-B, registra tiempos usando GPS,
+# lee LM35 y MPU6050, y envía telemetría periódica por NRF24 (PIPE_TLM).
+#
+# Opción B: lógica de vueltas COMPLETA (FSM N-B-N-B) sin OLED.
+
+from machine import Pin, SPI, PWM, I2C, ADC, UART
+from nrf24l01 import NRF24L01
+import utime, struct, time
+
+# ------------------ NRF24 CONFIG ------------------
+spi = SPI(0, sck=Pin(2), mosi=Pin(3), miso=Pin(4))
+ce  = Pin(6, Pin.OUT, value=0)
+csn = Pin(5, Pin.OUT, value=1)
+
+PIPE_CMD = b'\xe1\xf0\xf0\xf0\xf0'   # RX pipe: recibe control (TX -> CAR)
+PIPE_TLM = b'\xc3\xf0\xf0\xf0\xf0'   # TX pipe: telemetría al módulo PC / base
+
+nrf = NRF24L01(spi, csn, ce, channel=120, payload_size=32)
+nrf.open_rx_pipe(1, PIPE_CMD)
+nrf.open_tx_pipe(PIPE_TLM)
+nrf.start_listening()
+
+# RF tweaks (opcional)
+nrf.reg_write(0x04, 0x5F)
+nrf.reg_write(0x06, 0x07)
+
+# ------------------ ACTUADORES ------------------
+# Servo en GP16
+servo = PWM(Pin(16))
+servo.freq(50)
+MIN_DUTY = 1802   # ~500us
+MAX_DUTY = 7864   # ~2500us
+
+def map_servo_us_to_duty(us):
+    if us < 1000: us = 1000
+    if us > 2000: us = 2000
+    span = us - 1000
+    duty = MIN_DUTY + int((span * (MAX_DUTY - MIN_DUTY)) / 1000)
+    return duty
+
+# ESC en GP17
+esc = PWM(Pin(17))
+esc.freq(50)
+print("🔋 Armando ESC...")
+esc.duty_ns(1000 * 1000)
+utime.sleep(2)
+print("✅ ESC armado")
+
+# ------------------ SENSORES ------------------
+# TCRT (seguidor) en GP26 (ADC0), LM35 en GP27 (ADC1)
+adc_tcrt = ADC(26)
+adc_lm35 = ADC(27)
+
+UMBRAL_BLANCO = 40000  # ajuste según tu sensor y pista
+
+def leer_temperatura_lm35():
+    raw = adc_lm35.read_u16()
+    volt = raw * 3.3 / 65535.0
+    temp_c = volt / 0.01
+    return temp_c
+
+def tcrt_es_negro():
+    return adc_tcrt.read_u16() >= UMBRAL_BLANCO
+
+# ------------------ GPS (UART1 remapeado a GP8/GP9) ------------------
+# USAR GP8 = TX (desde Pico), GP9 = RX (hacia Pico). GPS TX -> Pico GP9.
+uart_gps = UART(1, baudrate=9600, tx=Pin(8), rx=Pin(9), timeout=1000)
+
+try:
+    from micropyGPS import MicropyGPS
+    gps = MicropyGPS(-5)   # timezone Bogotá UTC-5
+    micropygps_ok = True
+except Exception:
+    gps = None
+    micropygps_ok = False
+
+def convertir_grados(secciones):
+    try:
+        g, m, hemi = secciones[0], secciones[1], secciones[2]
+    except:
+        return None
+    if g == 0 and m == 0:
+        return None
+    dec = g + (m/60.0)
+    if hemi in ('S','W'):
+        dec = -dec
+    return dec
+
+def velocidad_kmh(valor_speed):
+    if valor_speed is None:
+        return None
+    try:
+        if isinstance(valor_speed, (list, tuple)):
+            if len(valor_speed) >= 3:
+                return float(valor_speed[2])
+            if len(valor_speed) >= 1:
+                return float(valor_speed[0]) * 1.852
+        return float(valor_speed)
+    except:
+        return None
+
+# ------------------ MPU6050 (I2C1: GP14 SDA, GP15 SCL) ------------------
+i2c = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
+MPU_ADDR = 0x68
+try:
+    i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')  # wake up
+    utime.sleep_ms(50)
+    mpu_ok = True
+except Exception as e:
+    print("⚠ MPU6050 init error:", e)
+    mpu_ok = False
+
+def read_mpu6050():
+    try:
+        data = i2c.readfrom_mem(MPU_ADDR, 0x3B, 14)
+        ax = struct.unpack(">h", data[0:2])[0]
+        ay = struct.unpack(">h", data[2:4])[0]
+        az = struct.unpack(">h", data[4:6])[0]
+        gx = struct.unpack(">h", data[8:10])[0]
+        gy = struct.unpack(">h", data[10:12])[0]
+        gz = struct.unpack(">h", data[12:14])[0]
+        ax_g = ax / 16384.0
+        ay_g = ay / 16384.0
+        az_g = az / 16384.0
+        gx_dps = gx / 131.0
+        gy_dps = gy / 131.0
+        gz_dps = gz / 131.0
+        return (ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
+    except Exception:
+        return (0,0,0,0,0,0)
+
+# ------------------ TELEMETRÍA (empaquetado) ------------------
+def enviar_telemetria(lat, lon, speed_kmh, lap_count):
+    temp_c = int(leer_temperatura_lm35() * 10) & 0xFFFF
+    _, _, _, _, _, gz = read_mpu6050()
+    gyro_z_x10 = int(gz * 10) & 0xFFFF
+
+    lat_i = int(lat * 100000) if lat is not None else 0
+    lon_i = int(lon * 100000) if lon is not None else 0
+    sp_x10 = int(speed_kmh * 10) if speed_kmh is not None else 0
+
+    payload = struct.pack("<HhiiHB", temp_c, gyro_z_x10, lat_i, lon_i, sp_x10 & 0xFFFF, lap_count & 0xFF)
+    try:
+        nrf.stop_listening()
+        nrf.open_tx_pipe(PIPE_TLM)
+        nrf.send(payload)
+    except Exception as e:
+        print("⚠ Error enviando telemetría:", e)
+    finally:
+        nrf.start_listening()
+
+# ------------------ FSM (N-B-N-B) para detección de vueltas ------------------
+# Config FSM
+REBOT_MS = 100            # debounce entre cambios
+VENTANA_SEQ_MS = 6000     # tiempo máximo para completar secuencia
+TLM_INTERVAL_MS = 200     # frecuencia telemetría
+
+secuencia_esperada = [True, False, True, False]  # True=NEGRO, False=BLANCO
+fase = 0
+ultimo_color = None
+ultimo_ms_fase = 0
+inicio_ventana_ms = 0
+
+# registro de vueltas y tiempos
+vueltas = 0
+velocidades_vuelta = []
+horas_vuelta = []
+lat_vuelta = []
+lon_vuelta = []
+lap_times_ms = []
+last_lap_time_ms = 0
+
+# estado principal
+print("📡 RX listo | Servo+ESC + LM35 + MPU6050 + GPS + TCRT + NRF24 (FSM N-B-N-B)")
+
+steer_us = 1500
+throttle_us = 1000
+last_tlm_ms = utime.ticks_ms()
+
+# Helper: alimentar parser GPS sin bloquear
+def feed_gps_parser():
+    if not micropygps_ok:
+        return
+    n = uart_gps.any()
+    if n:
+        data = uart_gps.read(n)
+        if data:
+            for b in data:
+                try:
+                    gps.update(chr(b))
+                except:
+                    pass
+
+# Loop principal
+while True:
+    ahora = utime.ticks_ms()
+
+    # alimentar GPS
+    feed_gps_parser()
+
+    # ---------- RF: comandos de dirección ----------
+    if nrf.any():
+        try:
+            data = nrf.recv()
+            if len(data) >= 4:
+                steer_us, throttle_us = struct.unpack('<HH', data[:4])
+
+                # mover servo
+                servo_duty = map_servo_us_to_duty(steer_us)
+                servo.duty_u16(servo_duty)
+
+                # controlar ESC
+                if throttle_us < 1000: throttle_us = 1000
+                if throttle_us > 2000: throttle_us = 2000
+                esc.duty_ns(throttle_us * 1000)
+        except Exception as e:
+            print("❌ Error RX:", e)
+
+    # ---------- FSM TCRT (N-B-N-B) ----------
+    valor_adc = adc_tcrt.read_u16()
+    es_negro = (valor_adc >= UMBRAL_BLANCO)
+
+    # timeout ventana de secuencia
+    if fase != 0 and utime.ticks_diff(ahora, inicio_ventana_ms) > VENTANA_SEQ_MS:
+        fase = 0
+
+    # detectar cambio (flanco)
+    if ultimo_color is None:
+        ultimo_color = es_negro
+    elif es_negro != ultimo_color:
+        if utime.ticks_diff(ahora, ultimo_ms_fase) >= REBOT_MS:
+            ultimo_ms_fase = ahora
+            ultimo_color = es_negro
+
+            if fase == 0:
+                # debe iniciar en NEGRO
+                if es_negro == secuencia_esperada[0]:
+                    fase = 1
+                    inicio_ventana_ms = ahora
+            else:
+                # verificar si color actual es el esperado
+                if es_negro == secuencia_esperada[fase]:
+                    fase += 1
+                    if fase == 4:
+                        # secuencia completa -> vuelta
+                        # capturar snapshot GPS + tiempo
+                        hora_txt = None
+                        vel = None
+                        lat = None
+                        lon = None
+                        if micropygps_ok:
+                            try:
+                                hora_txt = "{:02d}:{:02d}:{:02d}".format(*gps.timestamp)
+                            except:
+                                hora_txt = None
+                            vel = velocidad_kmh(getattr(gps, "speed", None))
+                            lat = convertir_grados(getattr(gps, "latitude", None))
+                            lon = convertir_grados(getattr(gps, "longitude", None))
+
+                        # calcular lap time
+                        now_ms = utime.ticks_ms()
+                        if last_lap_time_ms == 0:
+                            lap_time = None
+                        else:
+                            lap_time = utime.ticks_diff(now_ms, last_lap_time_ms)
+                            lap_times_ms.append(lap_time)
+                        last_lap_time_ms = now_ms
+
+                        vueltas += 1
+                        velocidades_vuelta.append(vel if vel else 0)
+                        horas_vuelta.append(hora_txt)
+                        lat_vuelta.append(lat)
+                        lon_vuelta.append(lon)
+
+                        print("\n=== VUELTA {} ===".format(vueltas))
+                        if hora_txt is not None:
+                            print("Hora:", hora_txt)
+                        print("Lat:", lat, "Lon:", lon, "Vel:", vel)
+                        if lap_time is not None:
+                            print("Lap time (ms):", lap_time)
+                        else:
+                            print("Lap time: (inicio)")
+                        print("====================")
+
+                        # reiniciar FSM
+                        fase = 0
+                else:
+                    # color inesperado -> resincronizar si es NEGRO o reiniciar
+                    if es_negro == secuencia_esperada[0]:
+                        fase = 1
+                        inicio_ventana_ms = ahora
+                    else:
+                        fase = 0
+
+    # ---------- Telemetría periódica ----------
+    if utime.ticks_diff(ahora, last_tlm_ms) >= TLM_INTERVAL_MS:
+        lat = None
+        lon = None
+        speed = None
+        if micropygps_ok:
+            lat = convertir_grados(getattr(gps, "latitude", None))
+            lon = convertir_grados(getattr(gps, "longitude", None))
+            speed = velocidad_kmh(getattr(gps, "speed", None))
+
+        enviar_telemetria(lat, lon, speed, vueltas)
+        last_tlm_ms = ahora
+
+    utime.sleep_ms(5)
